@@ -32,6 +32,9 @@ The JSON must contain:
 The JSON MAY contain:
 - "viz_code": Python code using plotly to create a visualization
 
+If you include anything other than valid JSON, your response will be programmatically rejected.
+
+
 --------------------------------
 CHART SELECTION RULES (MANDATORY)
 --------------------------------
@@ -135,73 +138,71 @@ def generate_sql(prompt):
         raise
 
 
-def generate_query_plan(prompt):
-    """
-    Primary interface expected by the app.
+import re
+import json
 
-    Tries to parse a JSON plan from the LLM output.
-    Falls back to raw SQL if needed.
-    Always returns a dict.
-    """
-    logger.info("generate_query_plan: sending prompt to LLM")
+def generate_query_plan(prompt, retry=False):
+    logger.info("generate_query_plan: sending prompt to LLM | retry=%s", retry)
+
+    system_msg = (
+        "You are a backend service. "
+        "Return ONLY valid JSON. "
+        "Never explain. Never use markdown."
+    )
+
+    user_prompt = prompt
+    if retry:
+        user_prompt = (
+            "Return ONLY a valid JSON object with a single key 'sql'. "
+            "The SQL must be a complete SELECT query on table 'data'. "
+            "End the query with a semicolon.\n\n"
+            + prompt
+        )
+
+    response = _GROQ_CLIENT.chat.completions.create(
+        model=_GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_msg},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0
+    )
+
+    content = (response.choices[0].message.content or "").strip()
+    logger.debug("Raw LLM response:\n%s", content)
+
+    # -------- Parse attempt --------
     try:
-        response = _GROQ_CLIENT.chat.completions.create(
-            model=_GROQ_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0
-        )
-        content = response.choices[0].message.content
-        
-        # Check if content is None or empty
-        if not content:
-            logger.error("LLM returned empty response")
-            raise ValueError("LLM returned an empty response")
-        
-        content = content.strip()
-        
-        # Remove markdown code block formatting if present
-        if content.startswith("```"):
-            # Extract content between triple backticks
-            lines = content.split('\n')
-            # Skip the opening ``` line (and language identifier if present)
-            start_idx = 1
-            # Find the closing ```
-            end_idx = len(lines)
-            for i in range(1, len(lines)):
-                if lines[i].strip().startswith("```"):
-                    end_idx = i
-                    break
-            content = '\n'.join(lines[start_idx:end_idx]).strip()
-        
-        logger.debug(
-            "LLM response (truncated): %s",
-            (content[:300] + "...") if len(content) > 300 else content,
-        )
-
-        # Try to parse as JSON first
-        try:
-            plan = json.loads(content)
-            
-            # Validate it's a dict
-            if not isinstance(plan, dict):
-                logger.warning("LLM returned JSON but not a dict, treating as raw SQL")
-                return {"sql": content.strip()}
-            
-            # Clean up SQL if present
-            if "sql" in plan and isinstance(plan["sql"], str):
-                plan["sql"] = plan["sql"].strip()
-                
+        plan = json.loads(content)
+        if isinstance(plan, dict) and "sql" in plan:
             return plan
-            
-        except json.JSONDecodeError:
-            # Not JSON, check if it's raw SQL
-            if content.lower().strip().startswith("select"):
-                logger.info("LLM returned raw SQL (no JSON wrapper)")
-                return {"sql": content.strip()}
-            else:
-                logger.warning(f"LLM did not return valid JSON or SQL. Response: {content[:200]}")
-                raise ValueError(f"LLM response is neither valid JSON nor SQL. Got: {content[:200]}")
+    except json.JSONDecodeError:
+        pass
 
-    except Exception:
-        logger.exception("generate_query_plan: LLM call failed")
-        raise
+    # Strip markdown
+    code_block = re.search(r"```(?:sql)?([\s\S]*?)```", content, re.IGNORECASE)
+    if code_block:
+        content = code_block.group(1).strip()
+
+    # Extract SELECT
+    select_match = re.search(r"(select[\s\S]*)", content, re.IGNORECASE)
+    if select_match:
+        sql = select_match.group(1).strip()
+
+        # Reject truncated SQL
+        if " from " not in sql.lower():
+            logger.warning("Detected truncated SQL, retrying...")
+        else:
+            if not sql.endswith(";"):
+                sql += ";"
+            return {"sql": sql}
+
+    # -------- Retry once --------
+    if not retry:
+        return generate_query_plan(prompt, retry=True)
+
+    # -------- Hard fail --------
+    raise ValueError(
+        "LLM returned incomplete or invalid SQL after retry.\n"
+        f"Response:\n{content[:300]}"
+    )
